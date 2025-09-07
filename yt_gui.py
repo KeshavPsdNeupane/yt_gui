@@ -6,6 +6,7 @@ import os
 import sys
 import json
 from typing import Optional, TextIO, cast
+import re # Import the re module for regular expressions
 
 # -------------------------------
 # Paths
@@ -64,11 +65,14 @@ def browse_folder(var: tk.StringVar):
     folder = filedialog.askdirectory()
     if folder:
         var.set(folder)
-        save_config()
 
-def build_command(url: str, folder: str, type_format: str, is_audio: bool, quality: str = "Highest"):
-    output_template = os.path.join(folder, "%(playlist_index)s_%(title)s.%(ext)s")
-
+def build_command(url: str, folder: str, type_format: str, is_audio: bool, mode: str, quality: str = "Highest"):
+    # Change output template based on mode (single or playlist)
+    if mode == "playlist":
+        output_template = os.path.join(folder, "%(playlist_index)s_%(title)s.%(ext)s")
+    else:
+        output_template = os.path.join(folder, "%(title)s.%(ext)s")
+    
     common_flags = [
         "--ffmpeg-location", FFMPEG_PATH,
         "--no-check-certificate",
@@ -76,11 +80,15 @@ def build_command(url: str, folder: str, type_format: str, is_audio: bool, quali
         "--geo-bypass"
     ]
 
+    # Use cookies.txt if it exists
     if os.path.exists(COOKIE_FILE):
         common_flags += ["--cookies", COOKIE_FILE]
     else:
+        # Fallback to multi-browser detection
         BROWSERS = ["chrome", "firefox", "edge", "opera", "brave"]
-        common_flags += ["--cookies-from-browser", BROWSERS[0]]
+        for browser in BROWSERS:
+            common_flags += ["--cookies-from-browser", browser]
+            break
 
     if is_audio:
         command = [
@@ -97,7 +105,7 @@ def build_command(url: str, folder: str, type_format: str, is_audio: bool, quali
             "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]",
             "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
             "Highest": "bestvideo+bestaudio/best"
-        }.get(quality, "bestvideo+bestaudio/best")
+        }[quality]
         command = [
             YTDLP_PATH,
             "-f", fmt,
@@ -110,31 +118,39 @@ def build_command(url: str, folder: str, type_format: str, is_audio: bool, quali
 # DownloadItem class
 # -------------------------------
 class DownloadItem:
-    def __init__(self, parent_frame, url, folder_var):
+    def __init__(self, parent_frame, url, folder_var, mode):
         self.url = url
         self.folder_var = folder_var
+        self.mode = mode
         self.process: Optional[subprocess.Popen] = None
         self.command = None
+        self.total_items: Optional[int] = None
+        self.current_item: Optional[int] = None
 
         self.frame = tk.Frame(parent_frame, relief="groove", bd=1, padx=5, pady=5)
         self.frame.pack(fill="x", pady=2)
 
         tk.Label(self.frame, text=url, wraplength=500, anchor="w", justify="left").pack(anchor="w")
 
+        # Type drawer (Audio/Video)
         self.type_var = tk.StringVar(value="Video")
         type_menu = tk.OptionMenu(self.frame, self.type_var, "Video", "Audio", command=self.update_format_options)
         type_menu.pack(side="left", padx=5)
 
+        # Format drawer
         self.format_var = tk.StringVar(value="mp4")
         self.format_menu = tk.OptionMenu(self.frame, self.format_var, "mp4", "mkv", "webm")
         self.format_menu.pack(side="left", padx=5)
 
+        # Quality drawer (for video)
         self.quality_var = tk.StringVar(value="Highest")
         self.quality_menu = tk.OptionMenu(self.frame, self.quality_var, "360p","480p","720p","1080p","Highest")
         self.quality_menu.pack(side="left", padx=5)
 
+        # Download button
         tk.Button(self.frame, text="Download", command=self.start).pack(side="left", padx=5)
 
+        # Progress
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.frame, variable=self.progress_var, maximum=100, length=400)
         self.progress_bar.pack(pady=5)
@@ -159,65 +175,70 @@ class DownloadItem:
             for fmt in video_formats:
                 menu.add_command(label=fmt, command=lambda f=fmt: self.format_var.set(f))
 
-    def get_target_folder(self) -> str:
-        base = self.folder_var.get() or DOWNLOAD_DIR
-        subfolder = "Audio" if self.type_var.get() == "Audio" else "Video"
-        base = os.path.join(base, subfolder)
-        os.makedirs(base, exist_ok=True)
-        return base
-
     def start(self):
-        target_folder = self.get_target_folder()
+        folder = self.folder_var.get() or DOWNLOAD_DIR
+        # Create subfolder based on type
+        subfolder = "Audio" if self.type_var.get() == "Audio" else "Video"
+        folder = os.path.join(folder, subfolder)
+        os.makedirs(folder, exist_ok=True)
+        self.folder_var.set(folder)
+        
         is_audio = self.type_var.get() == "Audio"
         self.command = build_command(
             self.url,
-            target_folder,
+            folder,
             self.format_var.get(),
             is_audio,
+            self.mode, # Pass the mode to build the correct command
             self.quality_var.get()
         )
         threading.Thread(target=self.run, daemon=True).start()
 
-    def run(self, playlist_index: Optional[int]=None, playlist_total: Optional[int]=None):
+    def run(self):
         if self.command is None:
             return
-
-        if playlist_index and playlist_total:
-            self.progress_label.config(text=f"Downloading {playlist_index}/{playlist_total}...")
-        else:
-            self.progress_label.config(text="Starting...")
-
+        self.progress_label.config(text="Starting...")
         self.progress_bar.pack(pady=5)
-
-        flags = 0
-        if os.name == "nt":
-            flags = subprocess.CREATE_NO_WINDOW
-
         self.process = subprocess.Popen(
             self.command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            creationflags=flags
+            creationflags=subprocess.CREATE_NO_WINDOW  # prevents console
         )
         assert self.process.stdout is not None
         stdout: TextIO = cast(TextIO, self.process.stdout)
 
         output_lines = []
 
-        for line in iter(stdout.readline, ""):
+        for line in stdout:
             line = line.strip()
             output_lines.append(line)
+            
+            # Check for playlist progress output
+            if self.mode == "playlist" and line.startswith("[download] Downloading item "):
+                match = re.search(r"(\d+) of (\d+)", line)
+                if match:
+                    self.current_item = int(match.group(1))
+                    self.total_items = int(match.group(2))
+            
+            # Check for individual file download percentage
             if line.startswith("[download]") and "%" in line:
                 try:
                     percent = float(line.split("%")[0].split()[-1])
                     self.progress_var.set(percent)
-                    if playlist_index and playlist_total:
-                        self.progress_label.config(text=f"{playlist_index}/{playlist_total}: {line}")
+                    
+                    if self.total_items:
+                        # Display playlist progress and file progress
+                        label_text = f"Downloading {self.current_item}/{self.total_items} - "
+                        label_text += line.replace("[download] ", "")
+                        self.progress_label.config(text=label_text)
                     else:
+                        # Only display file progress
                         self.progress_label.config(text=line)
-                except:
+
+                except (ValueError, IndexError):
                     pass
 
         self.process.wait()
@@ -238,7 +259,7 @@ class DownloadItem:
         txt = tk.Text(win, wrap="word")
         txt.pack(expand=True, fill="both", padx=10, pady=5)
         txt.insert("1.0", text)
-        txt.configure(state="disabled")
+        txt.configure(state="normal")
         tk.Button(win, text="Close", command=win.destroy).pack(pady=5)
 
 # -------------------------------
@@ -254,51 +275,36 @@ class TabPage:
         tk.Label(self.frame, text="URL:").pack(anchor="w", padx=10, pady=2)
         tk.Entry(self.frame, textvariable=self.url_var, width=80).pack(padx=10)
 
+        # Download folder
         tk.Label(self.frame, text="Download Folder:").pack(anchor="w", padx=10)
         self.folder_var = tk.StringVar(value=config[mode].get("download_folder", DOWNLOAD_DIR))
         f_frame = tk.Frame(self.frame)
         f_frame.pack(fill="x", padx=10)
         tk.Entry(f_frame, textvariable=self.folder_var, width=55).pack(side="left", fill="x", expand=True)
-        tk.Button(f_frame, text="Browse", command=lambda: browse_folder(self.folder_var)).pack(side="left", padx=5)
+        tk.Button(f_frame, text="Browse", command=lambda: self.browse_and_save()).pack(side="left", padx=5)
 
+        # Add to queue
         tk.Button(self.frame, text="Add to Queue", bg="blue", fg="white", command=self.add_download).pack(pady=5)
 
         self.queue_frame = tk.Frame(self.frame)
         self.queue_frame.pack(fill="both", expand=True)
 
         self.download_items = []
-        self.playlist_index = 0  # tracks currently downloading item
+
+    def browse_and_save(self):
+        browse_folder(self.folder_var)
+        config[self.mode]["download_folder"] = self.folder_var.get()
+        save_config()
 
     def add_download(self):
         url = self.url_var.get().strip()
         if url:
-            item = DownloadItem(self.queue_frame, url, self.folder_var)
+            item = DownloadItem(self.queue_frame, url, self.folder_var, self.mode) # Pass the mode to DownloadItem
             self.download_items.append(item)
             self.url_var.set("")
-            config[self.mode]["downloads"].append({"url": url})
-            config[self.mode]["download_folder"] = self.folder_var.get()
+            # Save to config
+            config[self.mode]["downloads"].append({"url":url})
             save_config()
-
-            # Start the playlist sequentially
-            if self.mode == "playlist" and len(self.download_items) == 1:
-                self.start_next_in_playlist()
-            elif self.mode == "single":
-                item.start()
-
-    def start_next_in_playlist(self):
-        if self.playlist_index >= len(self.download_items):
-            return  # all done
-
-        current_item = self.download_items[self.playlist_index]
-        total = len(self.download_items)
-        index = self.playlist_index + 1
-
-        def run_and_continue():
-            current_item.run(index, total)
-            self.playlist_index += 1
-            self.start_next_in_playlist()
-
-        threading.Thread(target=run_and_continue, daemon=True).start()
 
 # -------------------------------
 # Main GUI
@@ -307,8 +313,10 @@ root = tk.Tk()
 root.title("yt-dlp Multi Downloader")
 root.geometry("900x700")
 
+# Default folder label
 tk.Label(root, text=f"Default download folder: {DOWNLOAD_DIR}", bg="lightgrey", anchor="w").pack(fill="x", padx=5, pady=2)
 
+# Notebook for Single/Playlist tabs
 notebook = ttk.Notebook(root)
 notebook.pack(expand=True, fill="both")
 
