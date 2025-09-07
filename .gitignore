@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build
+dist/
+build/
+*.spec
+
+# Download and data folders
+download/
+data/yt_gui_config.json
+
+# OS files
+.DS_Store
+Thumbs.db
